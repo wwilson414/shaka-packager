@@ -7,6 +7,7 @@
 #include <packager/hls/base/simple_hls_notifier.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -55,6 +57,8 @@ const char kUriBase64Utf16Prefix[] = "data:text/plain;charset=UTF-16;base64,";
 const char kUriFairPlayPrefix[] = "skd://";
 const char kWidevineDashIfIopUUID[] =
     "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed";
+constexpr auto kDiscontinuitySignalPollInterval =
+    std::chrono::milliseconds(100);
 
 bool IsWidevineSystemId(const std::vector<uint8_t>& system_id) {
   return system_id.size() == std::size(media::kWidevineSystemId) &&
@@ -322,9 +326,35 @@ SimpleHlsNotifier::SimpleHlsNotifier(const HlsParams& hls_params)
       hls_params.is_independent_segments, hls_params.create_session_keys));
 }
 
-SimpleHlsNotifier::~SimpleHlsNotifier() {}
+SimpleHlsNotifier::~SimpleHlsNotifier() {
+  {
+    std::lock_guard<std::mutex> lock(discontinuity_signal_watcher_mutex_);
+    stop_discontinuity_signal_watcher_ = true;
+  }
+  discontinuity_signal_watcher_cv_.notify_all();
+  if (discontinuity_signal_watcher_.joinable()) {
+    discontinuity_signal_watcher_.join();
+  }
+}
 
 bool SimpleHlsNotifier::Init() {
+  if (hls_params().discontinuity_signal_file.empty()) {
+    return true;
+  }
+
+  std::lock_guard<std::mutex> lock(discontinuity_signal_watcher_mutex_);
+  if (discontinuity_signal_watcher_.joinable()) {
+    return true;
+  }
+  stop_discontinuity_signal_watcher_ = false;
+  try {
+    discontinuity_signal_watcher_ =
+        std::thread(&SimpleHlsNotifier::WatchDiscontinuitySignal, this);
+  } catch (const std::system_error& error) {
+    LOG(ERROR) << "Failed to start HLS discontinuity signal watcher: "
+               << error.what();
+    return false;
+  }
   return true;
 }
 
@@ -398,7 +428,6 @@ bool SimpleHlsNotifier::NotifyNewSegment(uint32_t stream_id,
     LOG(ERROR) << "Cannot find stream with ID: " << stream_id;
     return false;
   }
-  RefreshDiscontinuitySignal();
   auto& stream_entry = *stream_iterator->second;
   auto& media_playlist = stream_entry.media_playlist;
   if (stream_entry.discontinuity_pending) {
@@ -447,6 +476,17 @@ bool SimpleHlsNotifier::NotifyNewSegment(uint32_t stream_id,
   return true;
 }
 
+void SimpleHlsNotifier::WatchDiscontinuitySignal() {
+  std::unique_lock<std::mutex> lock(discontinuity_signal_watcher_mutex_);
+  while (!discontinuity_signal_watcher_cv_.wait_for(
+      lock, kDiscontinuitySignalPollInterval,
+      [this] { return stop_discontinuity_signal_watcher_; })) {
+    lock.unlock();
+    RefreshDiscontinuitySignal();
+    lock.lock();
+  }
+}
+
 void SimpleHlsNotifier::RefreshDiscontinuitySignal() {
   const std::string& signal_file = hls_params().discontinuity_signal_file;
   if (signal_file.empty()) {
@@ -454,12 +494,35 @@ void SimpleHlsNotifier::RefreshDiscontinuitySignal() {
   }
 
   std::ifstream input(signal_file);
-  std::string signal;
-  if (!input || !std::getline(input, signal) || signal.empty() ||
-      signal == last_discontinuity_signal_) {
+  if (!input) {
+    if (!discontinuity_signal_read_warning_logged_) {
+      LOG(WARNING) << "Failed to read HLS discontinuity signal file: "
+                   << signal_file;
+      discontinuity_signal_read_warning_logged_ = true;
+    }
     return;
   }
 
+  std::string signal;
+  if (!std::getline(input, signal)) {
+    if (input.bad() && !discontinuity_signal_read_warning_logged_) {
+      LOG(WARNING) << "Failed to read HLS discontinuity signal file: "
+                   << signal_file;
+      discontinuity_signal_read_warning_logged_ = true;
+    } else if (!input.bad()) {
+      discontinuity_signal_read_warning_logged_ = false;
+    }
+    return;
+  }
+  discontinuity_signal_read_warning_logged_ = false;
+  if (signal.empty()) {
+    return;
+  }
+
+  absl::MutexLock lock(lock_);
+  if (signal == last_discontinuity_signal_) {
+    return;
+  }
   last_discontinuity_signal_ = signal;
   for (auto& stream : stream_map_) {
     stream.second->discontinuity_pending = true;

@@ -419,7 +419,7 @@ void MediaPlaylist::AddEncryptionInfoForTesting(
 
 bool MediaPlaylist::SetMediaInfo(const MediaInfo& media_info) {
   const int32_t time_scale = GetTimeScale(media_info);
-  if (time_scale == 0) {
+  if (time_scale <= 0) {
     LOG(ERROR) << "MediaInfo does not contain a valid timescale.";
     return false;
   }
@@ -562,7 +562,11 @@ bool MediaPlaylist::WriteToFile(const std::filesystem::path& file_path,
           (first_segment || discontinuity_before_next_segment) &&
           !explicit_program_date_time) {
         const auto* segment_info =
-            static_cast<const SegmentInfoEntry*>(entry.get());
+            dynamic_cast<const SegmentInfoEntry*>(entry.get());
+        if (!segment_info) {
+          LOG(ERROR) << "Unexpected HLS entry type for EXTINF.";
+          return false;
+        }
         ProgramDateTimeEntry program_date_time(
             reference_time_ +
             absl::Seconds(static_cast<double>(segment_info->start_time()) /

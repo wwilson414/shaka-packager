@@ -20,8 +20,8 @@ ABSL_FLAG(std::string,
 ABSL_FLAG(std::string,
           hls_discontinuity_signal_file,
           "",
-          "Optional signal file; a changed non-empty token adds an HLS "
-          "discontinuity before the next segment in each media playlist.");
+          "Optional signal file; a changed non-empty token requests an HLS "
+          "discontinuity before the next segment after detection.");
 ABSL_FLAG(std::string,
           hls_base_url,
           "",

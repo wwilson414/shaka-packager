@@ -8,10 +8,13 @@
 #define PACKAGER_HLS_BASE_SIMPLE_HLS_NOTIFIER_H_
 
 #include <cstdint>
+#include <condition_variable>
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <absl/synchronization/mutex.h>
@@ -90,10 +93,16 @@ class SimpleHlsNotifier : public HlsNotifier {
     bool discontinuity_pending = false;
   };
 
+  void WatchDiscontinuitySignal();
   void RefreshDiscontinuitySignal();
 
   std::string master_playlist_dir_;
   std::string last_discontinuity_signal_;
+  std::mutex discontinuity_signal_watcher_mutex_;
+  std::condition_variable discontinuity_signal_watcher_cv_;
+  std::thread discontinuity_signal_watcher_;
+  bool stop_discontinuity_signal_watcher_ = false;
+  bool discontinuity_signal_read_warning_logged_ = false;
   int32_t target_duration_ = 0;
   bool end_stream = false;
 

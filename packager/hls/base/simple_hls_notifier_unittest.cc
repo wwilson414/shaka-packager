@@ -140,6 +140,36 @@ class SimpleHlsNotifierTest : public ::testing::Test {
     return notifier.stream_map_.size();
   }
 
+  struct PendingDiscontinuityCondition {
+    SimpleHlsNotifier* notifier;
+    uint32_t stream_id;
+  };
+
+  static bool IsDiscontinuityPending(
+      PendingDiscontinuityCondition* condition) {
+    const auto stream =
+        condition->notifier->stream_map_.find(condition->stream_id);
+    return stream != condition->notifier->stream_map_.end() &&
+           stream->second->discontinuity_pending;
+  }
+
+  bool WaitForDiscontinuityPending(SimpleHlsNotifier* notifier,
+                                   uint32_t stream_id) {
+    PendingDiscontinuityCondition condition{notifier, stream_id};
+    absl::MutexLock lock(notifier->lock_);
+    return notifier->lock_.AwaitWithTimeout(
+        absl::Condition(&SimpleHlsNotifierTest::IsDiscontinuityPending,
+                        &condition),
+        absl::Seconds(2));
+  }
+
+  bool IsDiscontinuityPendingForTesting(SimpleHlsNotifier* notifier,
+                                        uint32_t stream_id) {
+    PendingDiscontinuityCondition condition{notifier, stream_id};
+    absl::MutexLock lock(notifier->lock_);
+    return IsDiscontinuityPending(&condition);
+  }
+
   uint32_t SetupStream(const std::string& protection_scheme,
                        MockMediaPlaylist* mock_media_playlist,
                        SimpleHlsNotifier* notifier) {
@@ -397,7 +427,7 @@ TEST_F(SimpleHlsNotifierTest, NotifyNewSegment) {
   EXPECT_TRUE(notifier.Flush());
 }
 
-TEST_F(SimpleHlsNotifierTest, SignalFileAddsDiscontinuityToNextSegment) {
+TEST_F(SimpleHlsNotifierTest, SignalFileMarksEachStreamUntilItsNextSegment) {
   const std::filesystem::path signal_file =
       std::filesystem::temp_directory_path() /
       "shaka_hls_discontinuity_signal_test";
@@ -409,37 +439,61 @@ TEST_F(SimpleHlsNotifierTest, SignalFileAddsDiscontinuityToNextSegment) {
   }
   hls_params_.discontinuity_signal_file = signal_file.string();
 
-  auto* mock_media_playlist =
-      new MockMediaPlaylist("playlist.m3u8", "", "");
+  auto* mock_media_playlist1 = new MockMediaPlaylist("playlist1.m3u8", "", "");
+  auto* mock_media_playlist2 = new MockMediaPlaylist("playlist2.m3u8", "", "");
   auto factory = std::make_unique<MockMediaPlaylistFactory>();
   auto master_playlist = std::make_unique<MockMasterPlaylist>();
-  EXPECT_CALL(*mock_media_playlist, SetMediaInfo(_)).WillOnce(Return(true));
+  EXPECT_CALL(*mock_media_playlist1, SetMediaInfo(_)).WillOnce(Return(true));
+  EXPECT_CALL(*mock_media_playlist2, SetMediaInfo(_)).WillOnce(Return(true));
   EXPECT_CALL(*factory, CreateMock(_, _, _, _))
-      .WillOnce(Return(mock_media_playlist));
+      .WillOnce(Return(mock_media_playlist1))
+      .WillOnce(Return(mock_media_playlist2));
 
-  SimpleHlsNotifier notifier(hls_params_);
-  InjectMasterPlaylist(std::move(master_playlist), &notifier);
-  InjectMediaPlaylistFactory(std::move(factory), &notifier);
-  EXPECT_TRUE(notifier.Init());
+  auto notifier = std::make_unique<SimpleHlsNotifier>(hls_params_);
+  InjectMasterPlaylist(std::move(master_playlist), notifier.get());
+  InjectMediaPlaylistFactory(std::move(factory), notifier.get());
+  ASSERT_TRUE(notifier->Init());
   MediaInfo media_info;
-  uint32_t stream_id = 0;
-  EXPECT_TRUE(notifier.NotifyNewStream(
-      media_info, "playlist.m3u8", "name", "groupid", &stream_id));
-  EXPECT_CALL(*mock_media_playlist, GetLongestSegmentDuration())
-      .WillOnce(Return(2.0))
-      .WillOnce(Return(2.0));
-  EXPECT_CALL(*mock_media_playlist, AddSegment(_, _, _, _, _)).Times(2);
-  EXPECT_CALL(*mock_media_playlist, AddDiscontinuity()).Times(1);
+  uint32_t stream_id1 = 0;
+  uint32_t stream_id2 = 0;
+  ASSERT_TRUE(notifier->NotifyNewStream(
+      media_info, "playlist1.m3u8", "name1", "groupid", &stream_id1));
+  ASSERT_TRUE(notifier->NotifyNewStream(
+      media_info, "playlist2.m3u8", "name2", "groupid", &stream_id2));
 
-  EXPECT_TRUE(notifier.NotifyNewSegment(
-      stream_id, "old.m4s", 0, kAnyDuration, 0, kAnySize));
+  EXPECT_CALL(*mock_media_playlist1, GetLongestSegmentDuration())
+      .Times(2)
+      .WillRepeatedly(Return(2.0));
+  EXPECT_CALL(*mock_media_playlist2, GetLongestSegmentDuration())
+      .Times(2)
+      .WillRepeatedly(Return(2.0));
+  EXPECT_CALL(*mock_media_playlist1, AddSegment(_, _, _, _, _)).Times(2);
+  EXPECT_CALL(*mock_media_playlist2, AddSegment(_, _, _, _, _)).Times(2);
+  EXPECT_CALL(*mock_media_playlist1, AddDiscontinuity()).Times(1);
+  EXPECT_CALL(*mock_media_playlist2, AddDiscontinuity()).Times(1);
+
+  ASSERT_TRUE(notifier->NotifyNewSegment(
+      stream_id1, "old1.m4s", 0, kAnyDuration, 0, kAnySize));
+  ASSERT_TRUE(notifier->NotifyNewSegment(
+      stream_id2, "old2.m4s", 0, kAnyDuration, 0, kAnySize));
   {
     std::ofstream next_signal(signal_file, std::ios::trunc);
     ASSERT_TRUE(next_signal);
     next_signal << "epoch-2\n";
   }
-  EXPECT_TRUE(notifier.NotifyNewSegment(
-      stream_id, "new.m4s", 0, kAnyDuration, 0, kAnySize));
+
+  ASSERT_TRUE(WaitForDiscontinuityPending(notifier.get(), stream_id1));
+  ASSERT_TRUE(WaitForDiscontinuityPending(notifier.get(), stream_id2));
+
+  ASSERT_TRUE(notifier->NotifyNewSegment(
+      stream_id1, "new1.m4s", 0, kAnyDuration, 0, kAnySize));
+  EXPECT_FALSE(IsDiscontinuityPendingForTesting(notifier.get(), stream_id1));
+  EXPECT_TRUE(IsDiscontinuityPendingForTesting(notifier.get(), stream_id2));
+  ASSERT_TRUE(notifier->NotifyNewSegment(
+      stream_id2, "new2.m4s", 0, kAnyDuration, 0, kAnySize));
+  EXPECT_FALSE(IsDiscontinuityPendingForTesting(notifier.get(), stream_id2));
+
+  notifier.reset();
   std::filesystem::remove(signal_file);
 }
 

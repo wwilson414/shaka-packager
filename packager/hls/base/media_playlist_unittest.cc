@@ -123,6 +123,14 @@ TEST_F(MediaPlaylistMultiSegmentTest, NoTimeScale) {
   EXPECT_FALSE(media_playlist_->SetMediaInfo(media_info));
 }
 
+TEST_F(MediaPlaylistMultiSegmentTest, RejectsNonPositiveTimeScale) {
+  valid_video_media_info_.set_reference_time_scale(0);
+  EXPECT_FALSE(media_playlist_->SetMediaInfo(valid_video_media_info_));
+
+  valid_video_media_info_.set_reference_time_scale(-kTimeScale);
+  EXPECT_FALSE(media_playlist_->SetMediaInfo(valid_video_media_info_));
+}
+
 TEST_F(MediaPlaylistMultiSegmentTest, SetMediaInfoText) {
   MediaInfo media_info;
   media_info.set_reference_time_scale(kTimeScale);
@@ -1325,6 +1333,29 @@ TEST_F(MediaPlaylistMultiSegmentTest, ProgramDateTime) {
 
   const char kMemoryFilePath[] = "memory://media.m3u8";
   EXPECT_TRUE(media_playlist_->WriteToFile(kMemoryFilePath, false, true));
+  ASSERT_FILE_STREQ(kMemoryFilePath, kExpectedOutput);
+}
+
+TEST_F(MediaPlaylistMultiSegmentTest, ProgramDateTimeWithoutReferenceTime) {
+  mutable_hls_params()->add_program_date_time = true;
+
+  ASSERT_TRUE(media_playlist_->SetMediaInfo(valid_video_media_info_));
+  media_playlist_->AddSegment("file1.ts", 0, 10 * kTimeScale, kZeroByteOffset,
+                              kMBytes);
+
+  const char kExpectedOutput[] =
+      "#EXTM3U\n"
+      "#EXT-X-VERSION:6\n"
+      "## Generated with https://github.com/shaka-project/shaka-packager "
+      "version test\n"
+      "#EXT-X-TARGETDURATION:10\n"
+      "#EXT-X-PLAYLIST-TYPE:VOD\n"
+      "#EXTINF:10.000,\n"
+      "file1.ts\n"
+      "#EXT-X-ENDLIST\n";
+
+  const char kMemoryFilePath[] = "memory://media-no-reference-time.m3u8";
+  ASSERT_TRUE(media_playlist_->WriteToFile(kMemoryFilePath, false, true));
   ASSERT_FILE_STREQ(kMemoryFilePath, kExpectedOutput);
 }
 
